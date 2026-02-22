@@ -1,4 +1,4 @@
-# ESP32 Desktop Monitor
+# ESP32 Monitor Mirror
 
 Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over USB Serial. Touch the display to control your PC with mouse clicks.
 
@@ -64,22 +64,25 @@ Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over U
 
 ```bash
 # Basic usage
-python transmitter.py --port COM13
+python3 transmitter.py --port COM13
 
 # Specific monitor (1-based index)
-python transmitter.py --port COM13 --monitor-index 2
+python3 transmitter.py --port COM13 --monitor-index 2
 
 # Use largest monitor
-python transmitter.py --port COM13 --prefer-largest
+python3 transmitter.py --port COM13 --prefer-largest
 
 # Adjust FPS and sensitivity
-python transmitter.py --port COM13 --target-fps 15 --threshold 8
+python3 transmitter.py --port COM13 --target-fps 15 --threshold 8
 
 # Rotate capture 90 degrees
-python transmitter.py --port COM13 --rotate 90
+python3 transmitter.py --port COM13 --rotate 90
 
 # Send full frames (no diffing)
-python transmitter.py --port COM13 --full-frame
+python3 transmitter.py --port COM13 --full-frame
+
+# Capture only a specific region of the monitor
+python3 transmitter.py --port COM13 --crop-x 100 --crop-y 50 --crop-width 800 --crop-height 480
 ```
 
 ### Options
@@ -95,6 +98,10 @@ python transmitter.py --port COM13 --full-frame
 | `--full-frame` | off | Send every pixel every frame |
 | `--max-updates-per-frame` | 2000 | Max runs per packet |
 | `--rotate` | 0 | Rotation (0, 90, 180, 270) |
+| `--crop-x` | 0 | Crop region X offset (pixels from monitor left) |
+| `--crop-y` | 0 | Crop region Y offset (pixels from monitor top) |
+| `--crop-width` | *(full)* | Crop region width (required for cropping) |
+| `--crop-height` | *(full)* | Crop region height (required for cropping) |
 
 ## Protocol
 

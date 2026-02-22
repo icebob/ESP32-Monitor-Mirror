@@ -34,6 +34,7 @@ class ScreenshotSerialSender:
         full_frame: bool,
         max_updates_per_frame: int,
         rotate_deg: int,
+        crop: Optional[tuple[int, int, int, int]] = None,
     ) -> None:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
@@ -44,6 +45,7 @@ class ScreenshotSerialSender:
         self.full_frame = full_frame
         self.max_updates_per_frame = max_updates_per_frame
         self.rotate_deg = rotate_deg
+        self.crop = crop
 
         self.ser: Optional[serial.Serial] = None
         self.prev_rgb: Optional[np.ndarray] = None
@@ -193,6 +195,16 @@ class ScreenshotSerialSender:
         if not monitor:
             print("[MON] No monitor selected or available")
             return False
+
+        # Apply crop region if specified
+        if self.crop:
+            cx, cy, cw, ch = self.crop
+            monitor = {
+                "left": monitor["left"] + cx,
+                "top": monitor["top"] + cy,
+                "width": cw,
+                "height": ch,
+            }
 
         self.monitor = monitor
         print(
@@ -369,11 +381,19 @@ def parse_args(argv=None):
     parser.add_argument("--full-frame", action="store_true", help="Send every pixel every frame")
     parser.add_argument("--max-updates-per-frame", type=int, default=2000, help="Max runs per packet (default 2000)")
     parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="Rotation degrees")
+    parser.add_argument("--crop-x", type=int, default=None, help="Crop region X offset (pixels from monitor left)")
+    parser.add_argument("--crop-y", type=int, default=None, help="Crop region Y offset (pixels from monitor top)")
+    parser.add_argument("--crop-width", type=int, default=None, help="Crop region width")
+    parser.add_argument("--crop-height", type=int, default=None, help="Crop region height")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    crop = None
+    if args.crop_width and args.crop_height:
+        crop = (args.crop_x or 0, args.crop_y or 0, args.crop_width, args.crop_height)
+
     sender = ScreenshotSerialSender(
         serial_port=args.port,
         baud_rate=args.baud,
@@ -384,6 +404,7 @@ def main(argv=None):
         full_frame=args.full_frame,
         max_updates_per_frame=args.max_updates_per_frame,
         rotate_deg=args.rotate,
+        crop=crop,
     )
     sender.run()
 
