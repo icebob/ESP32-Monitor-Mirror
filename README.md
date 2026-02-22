@@ -96,7 +96,7 @@ python3 transmitter.py --port COM13 --crop-x 100 --crop-y 50 --crop-width 800 --
 | `--target-fps` | 10 | Target frame rate |
 | `--threshold` | 5 | Pixel change threshold (0-255) |
 | `--full-frame` | off | Send every pixel every frame |
-| `--max-updates-per-frame` | 2000 | Max runs per packet |
+| `--max-updates-per-frame` | 8000 | Max runs per packet |
 | `--rotate` | 0 | Rotation (0, 90, 180, 270) |
 | `--crop-x` | 0 | Crop region X offset (pixels from monitor left) |
 | `--crop-y` | 0 | Crop region Y offset (pixels from monitor top) |

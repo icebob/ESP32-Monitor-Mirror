@@ -166,7 +166,7 @@ void showWaitingScreen() {
 
 void setup() {
   Serial.begin(2000000);
-  Serial.setRxBufferSize(32768);  // large receive buffer
+  Serial.setRxBufferSize(65536);  // large receive buffer
   delay(500);
 
   // Backlight on via LEDC PWM
@@ -229,6 +229,7 @@ void handlePacket() {
   uint16_t count = hdr[5] | (hdr[6] << 8);
 
   if (count == 0) {
+    Serial.write(0x06);  // ACK
     frameCount++;
     return;
   }
@@ -237,9 +238,7 @@ void handlePacket() {
   uint32_t payloadSize = (uint32_t)count * 8;
   if (!ensureRawBuffer(payloadSize)) return;
 
-  unsigned long t0 = millis();
   if (!readExactly(rawBuffer, payloadSize)) return;
-  unsigned long tRead = millis();
 
   // Draw
   tft.startWrite();
@@ -255,9 +254,8 @@ void handlePacket() {
     }
   }
   tft.endWrite();
-  unsigned long tDraw = millis();
 
-  // Send ACK byte - serial is reliable for this
+  // Send ACK
   Serial.write(0x06);
 
   frameCount++;

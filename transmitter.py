@@ -106,6 +106,10 @@ class ScreenshotSerialSender:
         sy = mon_top + int(ty * mon_h / DISPLAY_HEIGHT)
         return sx, sy
 
+    def wait_for_ack(self, timeout: float = 5.0) -> bool:
+        self._ack_event.clear()
+        return self._ack_event.wait(timeout)
+
     def _serial_reader(self) -> None:
         """Background thread: reads ACK and touch events from serial."""
         buf = bytearray()
@@ -121,10 +125,8 @@ class ScreenshotSerialSender:
                         buf = buf[1:]
                         self._ack_event.set()
                         continue
-                    # Check for touch packet: 'T','C','H' + 5 bytes = 8 bytes
                     idx = buf.find(b'TCH')
                     if idx < 0:
-                        # No TCH found, keep last 2 bytes for partial match
                         buf = buf[-2:] if len(buf) > 2 else buf
                         break
                     if idx > 0:
@@ -146,10 +148,6 @@ class ScreenshotSerialSender:
             except Exception:
                 if self._running:
                     time.sleep(0.01)
-
-    def wait_for_ack(self, timeout: float = 5.0) -> bool:
-        self._ack_event.clear()
-        return self._ack_event.wait(timeout)
 
     def _start_reader_thread(self) -> None:
         self._running = True
@@ -255,41 +253,54 @@ class ScreenshotSerialSender:
             diff = np.abs(rgb.astype(np.int16) - self.prev_rgb.astype(np.int16))
             mask = diff.max(axis=2) > self.threshold
 
-        runs: list[tuple[int, int, int, int]] = []
+        # Vectorized RLE: process each row with numpy
+        all_runs = []
         for y in range(DISPLAY_HEIGHT):
             row_mask = mask[y]
             if not row_mask.any():
                 continue
-            x = 0
-            while x < DISPLAY_WIDTH:
-                if not row_mask[x]:
-                    x += 1
-                    continue
-                x0 = x
-                color = int(rgb565[y, x0])
-                x += 1
-                while x < DISPLAY_WIDTH and row_mask[x] and int(rgb565[y, x]) == color:
-                    x += 1
-                runs.append((y, x0, x - x0, color))
+            indices = np.where(row_mask)[0]
+            colors = rgb565[y, indices]
+            if len(indices) == 1:
+                all_runs.append(np.array([[y, indices[0], 1, colors[0]]], dtype=np.uint16))
+                continue
+            # Break where index is non-consecutive or color changes
+            breaks = np.where(
+                (np.diff(indices) != 1) | (np.diff(colors) != 0)
+            )[0] + 1
+            starts = np.concatenate([[0], breaks])
+            lengths = np.diff(np.concatenate([starts, [len(indices)]]))
+            x_starts = indices[starts]
+            run_colors = colors[starts]
+            n = len(starts)
+            row_runs = np.column_stack([
+                np.full(n, y, dtype=np.uint16),
+                x_starts.astype(np.uint16),
+                lengths.astype(np.uint16),
+                run_colors.astype(np.uint16),
+            ])
+            all_runs.append(row_runs)
 
-        if not runs:
+        if not all_runs:
             return []
+
+        runs_array = np.vstack(all_runs)
+        total_runs = len(runs_array)
 
         packets: list[bytes] = []
         max_per = max(1, self.max_updates_per_frame)
         start = 0
-        while start < len(runs):
-            end = min(start + max_per, len(runs))
-            slice_count = end - start
+        while start < total_runs:
+            end = min(start + max_per, total_runs)
+            count = end - start
             header = (
                 b"PXUR"
                 + bytes([RUN_HEADER_VERSION])
                 + struct.pack("<I", self.frame_id)
-                + struct.pack("<H", slice_count)
+                + struct.pack("<H", count)
             )
             payload = bytearray(header)
-            for y, x0, length, color in runs[start:end]:
-                payload.extend(struct.pack("<HHHH", y, x0, length, color))
+            payload.extend(runs_array[start:end].tobytes())
             packets.append(bytes(payload))
             start = end
 
@@ -331,7 +342,6 @@ class ScreenshotSerialSender:
                         self.ser.write(pkt)
                         sent_packets += 1
                         sent_runs += runs_in_pkt
-                        # Wait for ACK from receiver via reader thread
                         if runs_in_pkt > 0 and not self.wait_for_ack(10.0):
                             print("[ACK] Timeout - no ACK received")
                     except Exception as exc:
@@ -379,7 +389,7 @@ def parse_args(argv=None):
     parser.add_argument("--target-fps", type=float, default=10.0, help="Target FPS (default 10)")
     parser.add_argument("--threshold", type=int, default=5, help="Pixel change threshold (default 5)")
     parser.add_argument("--full-frame", action="store_true", help="Send every pixel every frame")
-    parser.add_argument("--max-updates-per-frame", type=int, default=2000, help="Max runs per packet (default 2000)")
+    parser.add_argument("--max-updates-per-frame", type=int, default=8000, help="Max runs per packet (default 8000)")
     parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="Rotation degrees")
     parser.add_argument("--crop-x", type=int, default=None, help="Crop region X offset (pixels from monitor left)")
     parser.add_argument("--crop-y", type=int, default=None, help="Crop region Y offset (pixels from monitor top)")
