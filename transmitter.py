@@ -1,44 +1,32 @@
 #!/usr/bin/env python3
 """
-Pixel Update Screenshot Sender
-Captures a monitor (defaults to the leftmost) as the video source and streams
-per-pixel updates to the ESP32 receiver using the same pixel-update protocol.
+Pixel Update Screenshot Sender (Serial version)
+Captures a monitor and streams run-length encoded pixel updates
+to the ESP32 receiver over USB serial.
 """
 
 import argparse
-import socket
+import ctypes
 import struct
+import threading
 import time
 from typing import Optional, Sequence
 
 import cv2
 import mss
 import numpy as np
-import ctypes
+import serial
 
-try:
-    from Quartz import CGEventCreate, CGEventGetLocation
-except Exception:  # noqa: BLE001
-    CGEventCreate = None  # type: ignore
-    CGEventGetLocation = None  # type: ignore
+DISPLAY_WIDTH = 800
+DISPLAY_HEIGHT = 480
+RUN_HEADER_VERSION = 0x02
 
 
-class CGPoint(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
-
-DEFAULT_IP = "192.168.1.100"
-DEFAULT_PORT = 8090
-DISPLAY_WIDTH = 135
-DISPLAY_HEIGHT = 240
-HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
-RUN_HEADER_VERSION = 0x01  # version for run packets
-
-
-class ScreenshotPixelSender:
+class ScreenshotSerialSender:
     def __init__(
         self,
-        ip: str,
-        port: int,
+        serial_port: str,
+        baud_rate: int,
         monitor_index: Optional[int],
         prefer_largest: bool,
         target_fps: float,
@@ -46,10 +34,9 @@ class ScreenshotPixelSender:
         full_frame: bool,
         max_updates_per_frame: int,
         rotate_deg: int,
-        show_cursor: bool,
     ) -> None:
-        self.ip = ip
-        self.port = port
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
         self.monitor_index = monitor_index
         self.prefer_largest = prefer_largest
         self.target_fps = target_fps
@@ -57,59 +44,121 @@ class ScreenshotPixelSender:
         self.full_frame = full_frame
         self.max_updates_per_frame = max_updates_per_frame
         self.rotate_deg = rotate_deg
-        self.show_cursor = show_cursor
 
-        self.sock: Optional[socket.socket] = None
-        self.prev_rgb: Optional[np.ndarray] = None  # (H, W, 3) uint8
+        self.ser: Optional[serial.Serial] = None
+        self.prev_rgb: Optional[np.ndarray] = None
         self.sent_initial_full: bool = False
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
         self.sct: Optional[mss.mss] = None
-        self.cursor_warned: bool = False
-        self.cursor_backend: Optional[tuple[str, Optional[ctypes.CDLL]]] = self._init_cursor_backend()
-
-    def _init_cursor_backend(self) -> Optional[tuple[str, Optional[ctypes.CDLL]]]:
-        # Prefer Quartz if available (pyobjc); otherwise fall back to CoreGraphics via ctypes
-        if CGEventCreate is not None and CGEventGetLocation is not None:
-            return ("quartz", None)
-        try:
-            cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-            cg.CGEventCreate.restype = ctypes.c_void_p
-            cg.CGEventGetLocation.restype = CGPoint
-            cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
-            return ("ctypes", cg)
-        except Exception:
-            return None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._ack_event = threading.Event()
 
     # Connection helpers -------------------------------------------------
-    def ensure_connection(self) -> bool:
-        if self.sock:
+    def connect(self) -> bool:
+        try:
+            print(f"[SERIAL] Opening {self.serial_port} at {self.baud_rate} baud")
+            self.ser = serial.Serial(
+                self.serial_port,
+                self.baud_rate,
+                timeout=5,
+                write_timeout=10,
+            )
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+            time.sleep(0.5)  # let ESP32 settle
+            print("[SERIAL] OK Connected")
             return True
-        return self.connect()
-
-    def connect(self, retries: int = 3) -> bool:
-        for attempt in range(1, retries + 1):
-            try:
-                if self.sock:
-                    self.sock.close()
-                print(f"[CONNECT] Attempt {attempt}/{retries} to {self.ip}:{self.port}")
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.sock.settimeout(10)
-                self.sock.connect((self.ip, self.port))
-                print("[CONNECT] ✓ Connected")
-                return True
-            except Exception as exc:  # noqa: BLE001
-                print(f"[CONNECT] ✗ {type(exc).__name__}: {exc}")
-                if attempt < retries:
-                    time.sleep(2)
-        return False
+        except Exception as exc:
+            print(f"[SERIAL] FAIL {type(exc).__name__}: {exc}")
+            return False
 
     def disconnect(self) -> None:
-        if self.sock:
-            self.sock.close()
-        self.sock = None
-        print("[CONNECT] Disconnected")
+        if self.ser:
+            self.ser.close()
+        self.ser = None
+        self.prev_rgb = None
+        self.sent_initial_full = False
+        print("[SERIAL] Disconnected")
+
+    # Touch input handling -----------------------------------------------
+    def _mouse_move(self, x: int, y: int) -> None:
+        ctypes.windll.user32.SetCursorPos(x, y)
+
+    def _mouse_down(self) -> None:
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+
+    def _mouse_up(self) -> None:
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+
+    def _map_touch_to_screen(self, tx: int, ty: int) -> tuple[int, int]:
+        """Map touch coords (800x480) to monitor pixel coords."""
+        if not self.monitor:
+            return tx, ty
+        mon_left = self.monitor.get("left", 0)
+        mon_top = self.monitor.get("top", 0)
+        mon_w = self.monitor.get("width", DISPLAY_WIDTH)
+        mon_h = self.monitor.get("height", DISPLAY_HEIGHT)
+        sx = mon_left + int(tx * mon_w / DISPLAY_WIDTH)
+        sy = mon_top + int(ty * mon_h / DISPLAY_HEIGHT)
+        return sx, sy
+
+    def _serial_reader(self) -> None:
+        """Background thread: reads ACK and touch events from serial."""
+        buf = bytearray()
+        while self._running and self.ser and self.ser.is_open:
+            try:
+                data = self.ser.read(self.ser.in_waiting or 1)
+                if not data:
+                    continue
+                buf.extend(data)
+                while buf:
+                    # Check for ACK byte (0x06)
+                    if buf[0] == 0x06:
+                        buf = buf[1:]
+                        self._ack_event.set()
+                        continue
+                    # Check for touch packet: 'T','C','H' + 5 bytes = 8 bytes
+                    idx = buf.find(b'TCH')
+                    if idx < 0:
+                        # No TCH found, keep last 2 bytes for partial match
+                        buf = buf[-2:] if len(buf) > 2 else buf
+                        break
+                    if idx > 0:
+                        buf = buf[idx:]
+                    if len(buf) < 8:
+                        break
+                    tx = buf[3] | (buf[4] << 8)
+                    ty = buf[5] | (buf[6] << 8)
+                    ttype = buf[7]
+                    buf = buf[8:]
+                    sx, sy = self._map_touch_to_screen(tx, ty)
+                    if ttype == 0:  # press
+                        self._mouse_move(sx, sy)
+                        self._mouse_down()
+                    elif ttype == 1:  # move
+                        self._mouse_move(sx, sy)
+                    elif ttype == 2:  # release
+                        self._mouse_up()
+            except Exception:
+                if self._running:
+                    time.sleep(0.01)
+
+    def wait_for_ack(self, timeout: float = 5.0) -> bool:
+        self._ack_event.clear()
+        return self._ack_event.wait(timeout)
+
+    def _start_reader_thread(self) -> None:
+        self._running = True
+        self._reader_thread = threading.Thread(target=self._serial_reader, daemon=True)
+        self._reader_thread.start()
+
+    def _stop_reader_thread(self) -> None:
+        self._running = False
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
+            self._reader_thread = None
 
     # Monitor helpers ----------------------------------------------------
     @staticmethod
@@ -124,26 +173,19 @@ class ScreenshotPixelSender:
             print(f"[MON] Invalid monitor index {monitor_index}; available 1..{len(monitors) - 1}")
             return None
 
-        usable_monitors = monitors[1:]  # index 0 is the virtual bounding box
+        usable_monitors = monitors[1:]
         if not usable_monitors:
             return None
 
         if prefer_largest:
-            return max(
-                usable_monitors,
-                key=lambda m: m.get("width", 0) * m.get("height", 0),
-            )
+            return max(usable_monitors, key=lambda m: m.get("width", 0) * m.get("height", 0))
 
-        # Default: choose the leftmost monitor (smallest 'left' coordinate)
-        usable_monitors = monitors[1:]  # index 0 is the virtual bounding box
-        if not usable_monitors:
-            return None
         return min(usable_monitors, key=lambda m: m.get("left", 0))
 
     def setup_capture(self) -> bool:
         try:
             self.sct = mss.mss()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"[MON] Unable to start screen capture: {exc}")
             return False
 
@@ -164,65 +206,11 @@ class ScreenshotPixelSender:
             return None
         try:
             shot = self.sct.grab(self.monitor)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"[MON] Capture failed: {exc}")
             return None
-        # mss returns BGRA; drop alpha
         frame = np.array(shot)[:, :, :3]
         return frame
-
-    # Cursor helpers -----------------------------------------------------
-    def get_cursor_global(self) -> Optional[tuple[int, int]]:
-        if not self.cursor_backend:
-            if self.show_cursor and not self.cursor_warned:
-                print(
-                    "[CURSOR] No cursor backend available (need Screen Recording permission and "
-                    "either Quartz/pyobjc or CoreGraphics via ctypes)"
-                )
-                self.cursor_warned = True
-            return None
-        backend, cg = self.cursor_backend
-        try:
-            if backend == "quartz":
-                evt = CGEventCreate(None)
-                if evt is None:
-                    return None
-                loc = CGEventGetLocation(evt)
-                return int(loc.x), int(loc.y)
-            if backend == "ctypes" and cg is not None:
-                evt = cg.CGEventCreate(None)
-                if not evt:
-                    return None
-                loc = cg.CGEventGetLocation(evt)
-                return int(loc.x), int(loc.y)
-        except Exception:
-            return None
-        return None
-
-    def map_cursor_to_local(self, cursor: tuple[int, int]) -> Optional[tuple[int, int]]:
-        if not self.monitor:
-            return None
-        cx, cy = cursor
-        left = int(self.monitor.get("left", 0))
-        top = int(self.monitor.get("top", 0))
-        width = int(self.monitor.get("width", 0))
-        height = int(self.monitor.get("height", 0))
-
-        if width <= 0 or height <= 0:
-            return None
-
-        local_x = cx - left
-        local_y = cy - top
-        if local_x < 0 or local_y < 0 or local_x >= width or local_y >= height:
-            if self.show_cursor and not self.cursor_warned:
-                print(f"[CURSOR] Cursor not on selected monitor (global {cx},{cy})")
-                self.cursor_warned = True
-            return None  # cursor not on this monitor
-
-        if self.show_cursor and not self.cursor_warned:
-            print(f"[CURSOR] Global {cx},{cy} -> local {local_x},{local_y}")
-            self.cursor_warned = True
-        return int(local_x), int(local_y)
 
     # Conversion helpers -------------------------------------------------
     @staticmethod
@@ -232,44 +220,9 @@ class ScreenshotPixelSender:
         b = (rgb[:, :, 2] >> 3).astype(np.uint16)
         return (r << 11) | (g << 5) | b
 
-    def draw_cursor_icon(self, frame: np.ndarray, point: tuple[int, int]) -> None:
-        x, y = point
-        # Simple white arrow with black outline, drawn on full-res frame
-        scale = 1.8  # enlarge arrow
-        pts = np.array(
-            [
-                (0, 0),
-                (0, int(12 * scale)),
-                (int(4 * scale), int(10 * scale)),
-                (int(8 * scale), int(16 * scale)),
-                (int(10 * scale), int(14 * scale)),
-                (int(6 * scale), int(8 * scale)),
-                (int(12 * scale), int(8 * scale)),
-            ],
-            dtype=np.int32,
-        )
-        pts[:, 0] += x
-        pts[:, 1] += y
-
-        cv2.fillPoly(frame, [pts], (0, 0, 0))
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-        cv2.fillPoly(frame, [pts], (255, 255, 255))
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
-
-    def resize_and_convert(
-        self, frame: np.ndarray, cursor_point_local: Optional[tuple[int, int]]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        # Ensure contiguous buffer for OpenCV drawing (mss can return non-contiguous)
+    def resize_and_convert(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         frame = np.ascontiguousarray(frame)
 
-        # Draw cursor on the full-res capture before rotation/scale
-        if cursor_point_local:
-            cx, cy = cursor_point_local
-            h, w, _ = frame.shape
-            if 0 <= cx < w and 0 <= cy < h:
-                self.draw_cursor_icon(frame, (cx, cy))
-
-        # Apply rotation to match device orientation
         if self.rotate_deg == 90:
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         elif self.rotate_deg == 180:
@@ -278,77 +231,19 @@ class ScreenshotPixelSender:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         rgb565 = self.rgb888_to_rgb565(rgb)
         return rgb, rgb565
 
     # Packet creation ----------------------------------------------------
-    def build_packets(self, rgb: np.ndarray, rgb565: np.ndarray) -> list[bytes]:
-        # Force the first frame to be full-frame, then optionally delta-mode
+    def build_run_packets(self, rgb: np.ndarray, rgb565: np.ndarray) -> list[bytes]:
         if self.full_frame or not self.sent_initial_full or self.prev_rgb is None:
             mask = np.ones((DISPLAY_HEIGHT, DISPLAY_WIDTH), dtype=bool)
         else:
             diff = np.abs(rgb.astype(np.int16) - self.prev_rgb.astype(np.int16))
             mask = diff.max(axis=2) > self.threshold
 
-        ys, xs = np.nonzero(mask)
-        colors = rgb565[ys, xs]
-        count = len(colors)
-
-        # If no pixels changed, send an empty pixel frame to keep sync
-        packets: list[bytes] = []
-        if count == 0:
-            header = (
-                b"PXUP"
-                + bytes([HEADER_VERSION])
-                + struct.pack("<I", self.frame_id)
-                + struct.pack("<H", 0)
-            )
-            packets.append(header)
-            self.frame_id += 1
-            return packets
-
-        # Try run-length encoding by rows; choose smaller payload
-        run_packets = self._build_run_packets(mask, rgb565)
-        pixel_packets = self._build_pixel_packets(xs, ys, colors, count)
-
-        run_bytes = sum(len(p) for p in run_packets)
-        pixel_bytes = sum(len(p) for p in pixel_packets)
-        if run_bytes < pixel_bytes:
-            self.frame_id += len(run_packets)
-            return run_packets
-        self.frame_id += len(pixel_packets)
-        return pixel_packets
-
-    def _build_pixel_packets(
-        self, xs: np.ndarray, ys: np.ndarray, colors: np.ndarray, count: int
-    ) -> list[bytes]:
-        packets: list[bytes] = []
-        max_per = max(1, self.max_updates_per_frame)
-        start = 0
-        while start < count:
-            end = min(start + max_per, count)
-            slice_count = end - start
-            header = (
-                b"PXUP"
-                + bytes([HEADER_VERSION])
-                + struct.pack("<I", self.frame_id)
-                + struct.pack("<H", slice_count)
-            )
-            payload = bytearray(header)
-            append = payload.extend
-            for x, y, color in zip(xs[start:end], ys[start:end], colors[start:end]):
-                append(struct.pack("<BBH", int(x), int(y), int(color)))
-            packets.append(bytes(payload))
-            start = end
-        return packets
-
-    def _build_run_packets(self, mask: np.ndarray, rgb565: np.ndarray) -> list[bytes]:
-        packets: list[bytes] = []
-        max_per = max(1, self.max_updates_per_frame)
-        runs: list[tuple[int, int, int, int]] = []  # y, x0, length, color
-
+        runs: list[tuple[int, int, int, int]] = []
         for y in range(DISPLAY_HEIGHT):
             row_mask = mask[y]
             if not row_mask.any():
@@ -363,23 +258,16 @@ class ScreenshotPixelSender:
                 x += 1
                 while x < DISPLAY_WIDTH and row_mask[x] and int(rgb565[y, x]) == color:
                     x += 1
-                length = x - x0
-                runs.append((y, x0, length, color))
+                runs.append((y, x0, x - x0, color))
 
-        total_runs = len(runs)
-        if total_runs == 0:
-            header = (
-                b"PXUP"
-                + bytes([HEADER_VERSION])
-                + struct.pack("<I", self.frame_id)
-                + struct.pack("<H", 0)
-            )
-            packets.append(header)
-            return packets
+        if not runs:
+            return []
 
+        packets: list[bytes] = []
+        max_per = max(1, self.max_updates_per_frame)
         start = 0
-        while start < total_runs:
-            end = min(start + max_per, total_runs)
+        while start < len(runs):
+            end = min(start + max_per, len(runs))
             slice_count = end - start
             header = (
                 b"PXUR"
@@ -388,166 +276,107 @@ class ScreenshotPixelSender:
                 + struct.pack("<H", slice_count)
             )
             payload = bytearray(header)
-            append = payload.extend
             for y, x0, length, color in runs[start:end]:
-                append(struct.pack("<BBBH", y, x0, length, color))
+                payload.extend(struct.pack("<HHHH", y, x0, length, color))
             packets.append(bytes(payload))
             start = end
+
+        self.frame_id += len(packets)
         return packets
 
     # Main loop ----------------------------------------------------------
     def run(self) -> None:
         if not self.setup_capture():
             return
-        if not self.ensure_connection():
+        if not self.connect():
             return
 
         frame_delay = 1.0 / self.target_fps if self.target_fps > 0 else 0.0
         frame_count = 0
         sent_packets = 0
-        sent_pixels = 0
+        sent_runs = 0
         start_t = time.time()
 
+        self._start_reader_thread()
         print("[STREAM] Starting screenshot update loop (Ctrl+C to stop)")
         try:
             while True:
                 frame_start = time.time()
                 frame = self.grab_frame()
                 if frame is None:
-                    print("[STREAM] Capture stopped")
                     break
 
-                cursor_point = None
-                if self.show_cursor:
-                    cur = self.get_cursor_global()
-                    if cur:
-                        cursor_point = self.map_cursor_to_local(cur)
-                    else:
-                        print("[CURSOR] Unable to read cursor position")
-
-                rgb, rgb565 = self.resize_and_convert(frame, cursor_point)
-                packets = self.build_packets(rgb, rgb565)
+                rgb, rgb565 = self.resize_and_convert(frame)
+                packets = self.build_run_packets(rgb, rgb565)
                 self.prev_rgb = rgb
 
-                if not self.ensure_connection():
-                    print("[SEND] Could not reconnect; exiting")
-                    break
+                if not packets and not self.sent_initial_full:
+                    continue
 
                 for pkt in packets:
-                    updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
-                    print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
+                    runs_in_pkt = struct.unpack_from("<H", pkt, 9)[0]
                     try:
-                        self.sock.sendall(pkt)
+                        self.ser.write(pkt)
                         sent_packets += 1
-                        sent_pixels += updates_in_frame
-                        if not self.sent_initial_full:
-                            self.sent_initial_full = True
-                    except (BrokenPipeError, ConnectionResetError):
-                        print("[SEND] Connection lost; attempting reconnect")
-                        self.disconnect()
-                        if not self.ensure_connection():
-                            print("[SEND] Reconnect failed; exiting")
-                            break
-                        try:
-                            self.sock.sendall(pkt)
-                            sent_packets += 1
-                            sent_pixels += updates_in_frame
-                        except Exception as exc:  # noqa: BLE001
-                            print(f"[SEND] Retry failed: {type(exc).__name__}: {exc}")
-                            break
-                    except Exception as exc:  # noqa: BLE001
+                        sent_runs += runs_in_pkt
+                        # Wait for ACK from receiver via reader thread
+                        if runs_in_pkt > 0 and not self.wait_for_ack(10.0):
+                            print("[ACK] Timeout - no ACK received")
+                    except Exception as exc:
                         print(f"[SEND] Error: {type(exc).__name__}: {exc}")
-                        self.disconnect()
                         break
-                else:
-                    frame_count += 1
-                    now = time.time()
-                    elapsed_frame = now - frame_start
-                    if frame_delay > 0 and elapsed_frame < frame_delay:
-                        time.sleep(frame_delay - elapsed_frame)
 
-                    # Stats roughly every second
-                    if now - start_t >= 1.0:
-                        elapsed = now - start_t
-                        fps_est = frame_count / elapsed if elapsed > 0 else 0.0
-                        print(
-                            f"[STATS] frames:{frame_count} packets:{sent_packets} "
-                            f"pixels:{sent_pixels} fps~{fps_est:.2f}"
-                        )
-                        start_t = now
-                        frame_count = 0
-                        sent_packets = 0
-                        sent_pixels = 0
-                    continue
-                break  # outer while if inner loop broke
+                if not self.sent_initial_full:
+                    self.sent_initial_full = True
+
+                frame_count += 1
+                now = time.time()
+                elapsed_frame = now - frame_start
+                if frame_delay > 0 and elapsed_frame < frame_delay:
+                    time.sleep(frame_delay - elapsed_frame)
+
+                if now - start_t >= 2.0:
+                    elapsed = now - start_t
+                    fps_est = frame_count / elapsed if elapsed > 0 else 0.0
+                    print(
+                        f"[STATS] frames:{frame_count} packets:{sent_packets} "
+                        f"runs:{sent_runs} fps~{fps_est:.1f}"
+                    )
+                    start_t = now
+                    frame_count = 0
+                    sent_packets = 0
+                    sent_runs = 0
+
         except KeyboardInterrupt:
             print("\n[STREAM] Interrupted by user")
         finally:
+            self._stop_reader_thread()
             self.disconnect()
             if self.sct:
                 self.sct.close()
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Capture a monitor and send per-pixel updates to ESP32"
+        description="Capture a monitor and send pixel updates to ESP32 over serial"
     )
-    parser.add_argument("--ip", type=str, default=DEFAULT_IP, help="ESP32 IP")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default 8090)")
-    parser.add_argument(
-        "--monitor-index",
-        type=int,
-        default=None,
-        help="Monitor index as reported by mss (1-based). Default: leftmost monitor",
-    )
-    parser.add_argument(
-        "--prefer-largest",
-        action="store_true",
-        help="Pick the largest-resolution monitor instead of the leftmost",
-    )
-    parser.add_argument(
-        "--target-fps",
-        type=float,
-        default=15.0,
-        help="Max capture/send rate (frames per second)",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=5,
-        help="Per-channel diff threshold (0-255) to consider a pixel changed",
-    )
-    parser.add_argument(
-        "--full-frame",
-        action="store_true",
-        help="Send every pixel of every frame (no diffing)",
-    )
-    parser.add_argument(
-        "--max-updates-per-frame",
-        type=int,
-        default=3000,
-        help="Cap updates per sent frame slice (default 3000)",
-    )
-    parser.add_argument(
-        "--rotate",
-        type=int,
-        choices=[0, 90, 180, 270],
-        default=0,
-        help="Rotate capture before scaling to match device orientation",
-    )
-    parser.add_argument(
-        "--show-cursor",
-        action="store_true",
-        help="Draw the cursor location onto the captured frame (requires Quartz/pyobjc on macOS)",
-    )
+    parser.add_argument("--port", type=str, required=True, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
+    parser.add_argument("--baud", type=int, default=2000000, help="Baud rate (default 2000000)")
+    parser.add_argument("--monitor-index", type=int, default=None, help="Monitor index (1-based)")
+    parser.add_argument("--prefer-largest", action="store_true", help="Use largest monitor")
+    parser.add_argument("--target-fps", type=float, default=10.0, help="Target FPS (default 10)")
+    parser.add_argument("--threshold", type=int, default=5, help="Pixel change threshold (default 5)")
+    parser.add_argument("--full-frame", action="store_true", help="Send every pixel every frame")
+    parser.add_argument("--max-updates-per-frame", type=int, default=2000, help="Max runs per packet (default 2000)")
+    parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="Rotation degrees")
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv=None):
     args = parse_args(argv)
-    sender = ScreenshotPixelSender(
-        ip=args.ip,
-        port=args.port,
+    sender = ScreenshotSerialSender(
+        serial_port=args.port,
+        baud_rate=args.baud,
         monitor_index=args.monitor_index,
         prefer_largest=args.prefer_largest,
         target_fps=args.target_fps,
@@ -555,11 +384,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         full_frame=args.full_frame,
         max_updates_per_frame=args.max_updates_per_frame,
         rotate_deg=args.rotate,
-        show_cursor=args.show_cursor,
     )
     sender.run()
 
 
 if __name__ == "__main__":
     main()
-

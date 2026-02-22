@@ -1,213 +1,162 @@
 # ESP32 Desktop Monitor
 
-Stream your computer screen to an ESP32 T-Display over WiFi. This project enables you to mirror your monitor to a small 1.14" LCD display connected to an ESP32.
+Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over USB Serial. Touch the display to control your PC with mouse clicks.
 
-## Hardware Requirements
+## Hardware
 
-### ESP32 Development Board
-- **Board**: TENSTAR T-Display ESP32-D0WD (or compatible ESP32 with integrated display)
-- **Chip**: ESP32-D0WD with CH9102 USB-to-Serial chip
-- **Memory**: 16MB Flash
-- **Display**: 1.14" ST7789 LCD (135x240 pixels)
-- **Connectivity**: WiFi and Bluetooth compatible
+- **Display**: [Elecrow CrowPanel ESP32-S3 7.0"](https://www.elecrow.com/esp32-display-7-inch-hmi-display-rgb-tft-lcd-touch-screen-support-lvgl.html) (800x480, RGB parallel, capacitive touch)
+- **Chip**: ESP32-S3-WROOM-1-N4R8 (4MB Flash, 8MB PSRAM)
+- **Display driver**: EK9716BD3, 16-bit RGB parallel bus
+- **Touch controller**: GT911 (I2C)
+- **Connection**: USB-C (Serial at 2Mbps)
+- **Computer**: Windows PC with Python 3.7+
 
-### Computer
-- Any computer running Python 3.7+
-- macOS, Linux, or Windows (with appropriate screen capture libraries)
+## Features
 
-## Software Requirements
+- Real-time screen mirroring at ~10 FPS
+- Differential frame updates (only changed pixels are sent)
+- Run-length encoded protocol for efficient bandwidth usage
+- ACK-based flow control for reliable transmission
+- Touch-to-mouse input: tap/drag on the display to control your PC
+- Configurable rotation, threshold, and FPS
 
-### ESP32 Side (Arduino IDE)
-1. **Arduino IDE** (1.8.x or 2.x) or **PlatformIO**
-2. **ESP32 Board Support Package**
-   - Add this URL to Arduino IDE Preferences → Additional Board Manager URLs:
-     ```
-     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-     ```
-   - Install "esp32" by Espressif Systems from Board Manager
-3. **TFT_eSPI Library**
-   - Install via Arduino Library Manager
-   - Or download from: https://github.com/Bodmer/TFT_eSPI
-   - **Important**: Configure the library for your display (see TFT_eSPI setup guide)
+## Setup
 
-### Computer Side (Python)
-- Python 3.7 or higher
-- Required packages (install via `pip install -r requirements.txt`):
-  - `opencv-python` - Image processing and scaling
-  - `mss` - Cross-platform screen capture
-  - `numpy` - Array operations
+### ESP32 (Arduino IDE)
 
-## Setup Instructions
-
-### 1. Configure ESP32 Receiver
-
-1. Open `receiver.ino` in Arduino IDE
-2. Update WiFi credentials:
-   ```cpp
-   const char* ssid = "YOUR_WIFI_SSID";
-   const char* password = "YOUR_WIFI_PASSWORD";
+1. Install [Arduino IDE](https://www.arduino.cc/en/software)
+2. Add ESP32 board support (Preferences > Additional Board Manager URLs):
    ```
-3. Configure TFT_eSPI library:
-   - Open `User_Setup.h` in the TFT_eSPI library folder
-   - Ensure your display driver (ST7789) is selected
-   - Verify pin definitions match your board
-   - For T-Display boards, typically:
-     - Driver: ST7789
-     - Width: 135, Height: 240
-     - Rotation: 0 (portrait)
-4. Select board: **Tools → Board → ESP32 Dev Module** (or your specific ESP32 board)
-5. Select port: **Tools → Port → [Your ESP32 port]**
-6. Upload the sketch
+   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   ```
+3. Install boards: **Board Manager > esp32 by Espressif Systems**
+4. Install libraries via **Library Manager**:
+   - **LovyanGFX** (display driver for RGB parallel bus)
+   - **TAMC_GT911** (touch controller)
+5. Open `receiver/receiver.ino`
+6. Board settings:
 
-### 2. Find ESP32 IP Address
+   | Setting | Value |
+   |---------|-------|
+   | Board | ESP32S3 Dev Module |
+   | Flash Size | 4MB |
+   | Partition Scheme | Huge APP (3MB No OTA / 1MB SPIFFS) |
+   | PSRAM | OPI PSRAM |
+   | USB CDC On Boot | **Enabled** |
 
-After uploading, open the Serial Monitor (115200 baud). The ESP32 will:
-- Connect to WiFi
-- Display its IP address on the screen
-- Print the IP address to Serial Monitor
+7. Upload
 
-Note the IP address (e.g., `192.168.1.100`).
+### PC (Python)
 
-### 3. Install Python Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-**macOS users**: Grant "Screen Recording" permission to Terminal (or your Python environment) when prompted.
-
-### 4. Run the Transmitter
-
-```bash
-python transmitter.py --ip <ESP32_IP_ADDRESS>
-```
-
-Replace `<ESP32_IP_ADDRESS>` with the IP address from step 2.
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   pip install pyserial
+   ```
+2. Connect the ESP32 via USB-C
+3. Find the COM port (Device Manager > Ports)
+4. Run:
+   ```bash
+   python transmitter.py --port COM13 --target-fps 10
+   ```
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Stream leftmost monitor to ESP32
-python transmitter.py --ip 192.168.1.100
+# Basic usage
+python transmitter.py --port COM13
 
-# Stream specific monitor (1-based index)
-python transmitter.py --ip 192.168.1.100 --monitor-index 2
+# Specific monitor (1-based index)
+python transmitter.py --port COM13 --monitor-index 2
 
-# Adjust frame rate (default: 15 FPS)
-python transmitter.py --ip 192.168.1.100 --target-fps 20
+# Use largest monitor
+python transmitter.py --port COM13 --prefer-largest
 
-# Adjust change detection sensitivity (default: 5)
-python transmitter.py --ip 192.168.1.100 --threshold 8
+# Adjust FPS and sensitivity
+python transmitter.py --port COM13 --target-fps 15 --threshold 8
+
+# Rotate capture 90 degrees
+python transmitter.py --port COM13 --rotate 90
+
+# Send full frames (no diffing)
+python transmitter.py --port COM13 --full-frame
 ```
 
-### Command Line Options
+### Options
 
-- `--ip <IP>` - ESP32 IP address (required)
-- `--port <PORT>` - TCP port (default: 8090)
-- `--monitor-index <N>` - Select monitor by index (1-based, default: leftmost)
-- `--prefer-largest` - Use largest monitor instead of leftmost
-- `--target-fps <FPS>` - Target frame rate (default: 15.0)
-- `--threshold <N>` - Pixel change threshold 0-255 (default: 5, higher = less sensitive)
-- `--full-frame` - Send all pixels every frame (no diffing, slower)
-- `--max-updates-per-frame <N>` - Max pixels per packet (default: 3000)
-- `--rotate <0|90|180|270>` - Rotate capture before scaling
-- `--show-cursor` - Draw cursor on captured frame (macOS only)
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port` | *(required)* | Serial port (e.g. COM13, /dev/ttyACM0) |
+| `--baud` | 2000000 | Baud rate |
+| `--monitor-index` | leftmost | Monitor index (1-based) |
+| `--prefer-largest` | off | Use largest monitor |
+| `--target-fps` | 10 | Target frame rate |
+| `--threshold` | 5 | Pixel change threshold (0-255) |
+| `--full-frame` | off | Send every pixel every frame |
+| `--max-updates-per-frame` | 2000 | Max runs per packet |
+| `--rotate` | 0 | Rotation (0, 90, 180, 270) |
 
-### Performance Tuning
+## Protocol
 
-For better frame rates:
+Communication uses USB Serial at 2Mbps with a custom binary protocol.
 
-1. **Increase threshold** (reduces bandwidth):
-   ```bash
-   python transmitter.py --ip 192.168.1.100 --threshold 8
-   ```
+### Display packets (PC -> ESP32)
 
-2. **Adjust frame rate**:
-   ```bash
-   python transmitter.py --ip 192.168.1.100 --target-fps 20
-   ```
+```
+Header: 'P' 'X' 'U' 'R' (4B) + version (1B, 0x02) + frame_id (uint32 LE) + count (uint16 LE)
+Body:   count entries of: y (uint16 LE) + x0 (uint16 LE) + length (uint16 LE) + color (uint16 LE) = 8B each
+```
 
-3. **Increase packet size** (for high-motion content):
-   ```bash
-   python transmitter.py --ip 192.168.1.100 --max-updates-per-frame 8000
-   ```
+The receiver sends a single ACK byte (`0x06`) after processing each packet.
 
-4. **ESP32 side**: If display is unstable, lower SPI frequency in `receiver.ino`:
-   ```cpp
-   const uint32_t SPI_TARGET_FREQ = 40000000;  // Lower from 80000000
-   ```
+### Touch packets (ESP32 -> PC)
 
-## How It Works
+```
+'T' 'C' 'H' + x (uint16 LE) + y (uint16 LE) + type (uint8) = 8 bytes
+type: 0 = press, 1 = move, 2 = release
+```
 
-### Protocol
+Touch coordinates are mapped from display space (800x480) to the captured monitor's pixel coordinates and translated into Windows mouse events.
 
-The system uses a custom protocol optimized for small displays:
+## Architecture
 
-1. **Frame Diffing**: Only pixels that changed are sent (configurable threshold)
-2. **Run-Length Encoding**: Consecutive pixels of the same color are encoded as runs
-3. **Automatic Selection**: The sender chooses the most efficient encoding (pixel-by-pixel vs. run-length)
-4. **Batched Updates**: All updates for a frame are received before applying to display
-
-### Packet Format
-
-**Pixel Packets** (`PXUP`):
-- Header: `'PXUP'` (4 bytes) + version (1 byte) + frame_id (4 bytes) + count (2 bytes)
-- Body: `count` entries of `x` (1 byte), `y` (1 byte), `color` (2 bytes, RGB565)
-
-**Run Packets** (`PXUR`):
-- Header: `'PXUR'` (4 bytes) + version (1 byte) + frame_id (4 bytes) + count (2 bytes)
-- Body: `count` entries of `y` (1 byte), `x0` (1 byte), `length` (1 byte), `color` (2 bytes, RGB565)
-
-### Optimizations
-
-- **High-Speed SPI**: 80MHz SPI clock (configurable, fallback to 40MHz if unstable)
-- **DMA Support**: Uses DMA for efficient display updates when available
-- **PSRAM Usage**: Leverages ESP32 PSRAM for large update buffers
-- **TCP_NODELAY**: Disables Nagle's algorithm for lower latency
+```
+transmitter.py (PC)          USB Serial 2Mbps          receiver.ino (ESP32)
++-----------------+          +-----------+          +------------------+
+| Screen capture  |  PXUR -> |           | -> PXUR | Parse & draw     |
+| Diff + RLE      |          |  Serial   |         | LovyanGFX RGB    |
+| Touch -> Mouse  |  <- TCH  |           |  TCH <- | GT911 touch read |
++-----------------+          +-----------+          +------------------+
+```
 
 ## Troubleshooting
 
-### Colors Appear Swapped
+### No image on display
+- Verify **USB CDC On Boot: Enabled** in Arduino IDE
+- Check COM port in Device Manager
+- Ensure the correct baud rate (2000000)
 
-If colors look wrong, adjust in `receiver.ino`:
-```cpp
-bool useBgrSetting = false;  // Try changing from true to false
-```
+### Low frame rate
+- Increase `--threshold` to reduce bandwidth
+- Lower `--target-fps` if serial can't keep up
+- Reduce `--max-updates-per-frame`
 
-### Low Frame Rate
+### Touch not working
+- Ensure TAMC_GT911 library is installed
+- Touch is polled during both packet sync and main loop
+- Coordinates are inverted to match display orientation
 
-1. Check WiFi signal strength
-2. Increase `--threshold` to reduce bandwidth
-3. Lower `--target-fps` if network can't keep up
-4. Ensure ESP32 and computer are on the same WiFi network
-
-### Connection Issues
-
-1. Verify ESP32 IP address in Serial Monitor
-2. Check firewall settings (port 8090)
-3. Ensure both devices are on the same network
-4. Try restarting the ESP32
-
-### Display Not Working
-
-1. Verify TFT_eSPI library configuration
-2. Check pin definitions in `User_Setup.h`
-3. Ensure backlight pin is correct (typically pin 4)
-4. Lower SPI frequency if display is unstable
+### Colors look wrong
+- The display uses RGB565 color format
+- BGR/RGB conversion happens in `transmitter.py` via OpenCV
 
 ## License
 
 This project is provided as-is for educational and personal use.
 
-## Contributing
-
-Contributions welcome! Please feel free to submit issues or pull requests.
-
 ## Acknowledgments
 
-- TFT_eSPI library by Bodmer
+- [LovyanGFX](https://github.com/lovyan03/LovyanGFX) - RGB parallel display driver
+- [TAMC_GT911](https://github.com/tamctec/gt911-arduino) - Touch controller library
 - ESP32 Arduino core by Espressif
-- mss library for cross-platform screen capture
-
+- [mss](https://github.com/BoboTiG/python-mss) - Cross-platform screen capture
