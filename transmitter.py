@@ -44,6 +44,7 @@ class ScreenshotSerialSender:
         rotate_deg: int,
         crop: Optional[tuple[int, int, int, int]] = None,
         window_title: Optional[str] = None,
+        window_crop_top: int = 0,
     ) -> None:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
@@ -57,6 +58,7 @@ class ScreenshotSerialSender:
         self.rotate_deg = rotate_deg
         self.crop = crop
         self.window_title = window_title
+        self.window_crop_top = window_crop_top
 
         self.ser: Optional[serial.Serial] = None
         self.prev_rgb: Optional[np.ndarray] = None
@@ -121,9 +123,9 @@ class ScreenshotSerialSender:
             try:
                 left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
                 w = right - left
-                h = bottom - top
+                h = bottom - top - self.window_crop_top
                 sx = left + int(cx * w / fit_w)
-                sy = top + int(cy * h / fit_h)
+                sy = top + self.window_crop_top + int(cy * h / fit_h)
                 return sx, sy
             except Exception:
                 return tx, ty
@@ -265,8 +267,9 @@ class ScreenshotSerialSender:
             win32gui.ReleaseDC(self.hwnd, hwnd_dc)
             win32gui.DeleteObject(bitmap.GetHandle())
 
-            # BGRA -> BGR
-            return frame[:, :, :3].copy()
+            # BGRA -> BGR, apply top crop
+            frame = frame[self.window_crop_top:, :, :3]
+            return frame.copy()
         except Exception as exc:
             print(f"[WIN] Capture failed: {exc}")
             return None
@@ -528,6 +531,7 @@ def parse_args(argv=None):
     parser.add_argument("--crop-height", type=int, default=None, help="Crop region height")
     parser.add_argument("--stats", action="store_true", help="Show periodic frame/packet statistics")
     parser.add_argument("--window", type=str, default=None, help="Capture window by title (partial match, e.g. 'AS1000_PFD')")
+    parser.add_argument("--window-crop-top", type=int, default=0, help="Pixels to crop from top of window (e.g. 32 to hide title bar)")
     parser.add_argument("--list-windows", action="store_true", help="List all visible windows and exit")
     return parser.parse_args(argv)
 
@@ -560,6 +564,7 @@ def main(argv=None):
         rotate_deg=args.rotate,
         crop=crop,
         window_title=args.window,
+        window_crop_top=args.window_crop_top,
     )
     sender.run()
 

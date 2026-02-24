@@ -85,6 +85,9 @@ python3 transmitter.py --port COM13 --window "Notepad"
 # Capture an MSFS pop-out instrument panel
 python3 transmitter.py --port COM13 --window "AS1000_PFD"
 
+# Hide the window title bar (crop top 32 pixels)
+python3 transmitter.py --port COM13 --window "WASMINSTRUMENT" --window-crop-top 32
+
 # --- Other options ---
 
 # Adjust FPS and sensitivity
@@ -113,6 +116,7 @@ python3 transmitter.py --port COM13 --stats
 | `--prefer-largest` | off | Use largest monitor |
 | `--window` | off | Capture window by title (partial match) |
 | `--list-windows` | off | List all visible windows and exit |
+| `--window-crop-top` | 0 | Pixels to crop from top of window (hide title bar) |
 | `--target-fps` | 10 | Target frame rate |
 | `--threshold` | 5 | Pixel change threshold (0-255) |
 | `--full-frame` | off | Send every pixel every frame |
