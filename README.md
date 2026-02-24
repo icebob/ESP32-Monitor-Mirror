@@ -14,10 +14,12 @@ Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over U
 ## Features
 
 - Real-time screen mirroring at ~10 FPS
+- **Window capture mode**: capture a specific window by title (ideal for MSFS pop-out panels)
 - Differential frame updates (only changed pixels are sent)
 - Run-length encoded protocol for efficient bandwidth usage
 - ACK-based flow control for reliable transmission
 - Touch-to-mouse input: tap/drag on the display to control your PC
+- Aspect-ratio preserving resize with letterboxing
 - Configurable rotation, threshold, and FPS
 
 ## Setup
@@ -51,7 +53,7 @@ Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over U
 1. Install dependencies:
    ```bash
    pip install -r requirements.txt
-   pip install pyserial
+   pip install pyserial pywin32
    ```
 2. Connect the ESP32 via USB-C
 3. Find the COM port (Device Manager > Ports)
@@ -63,7 +65,7 @@ Stream your computer screen to an Elecrow CrowPanel ESP32-S3 7.0" display over U
 ## Usage
 
 ```bash
-# Basic usage
+# Basic usage (captures primary monitor)
 python3 transmitter.py --port COM13
 
 # Specific monitor (1-based index)
@@ -71,6 +73,19 @@ python3 transmitter.py --port COM13 --monitor-index 2
 
 # Use largest monitor
 python3 transmitter.py --port COM13 --prefer-largest
+
+# --- Window capture mode ---
+
+# List all visible windows (no --port needed)
+python3 transmitter.py --list-windows
+
+# Capture a specific window by title (partial match, case-insensitive)
+python3 transmitter.py --port COM13 --window "Notepad"
+
+# Capture an MSFS pop-out instrument panel
+python3 transmitter.py --port COM13 --window "AS1000_PFD"
+
+# --- Other options ---
 
 # Adjust FPS and sensitivity
 python3 transmitter.py --port COM13 --target-fps 15 --threshold 8
@@ -83,6 +98,9 @@ python3 transmitter.py --port COM13 --full-frame
 
 # Capture only a specific region of the monitor
 python3 transmitter.py --port COM13 --crop-x 100 --crop-y 50 --crop-width 800 --crop-height 480
+
+# Show frame/packet statistics
+python3 transmitter.py --port COM13 --stats
 ```
 
 ### Options
@@ -93,6 +111,8 @@ python3 transmitter.py --port COM13 --crop-x 100 --crop-y 50 --crop-width 800 --
 | `--baud` | 2000000 | Baud rate |
 | `--monitor-index` | leftmost | Monitor index (1-based) |
 | `--prefer-largest` | off | Use largest monitor |
+| `--window` | off | Capture window by title (partial match) |
+| `--list-windows` | off | List all visible windows and exit |
 | `--target-fps` | 10 | Target frame rate |
 | `--threshold` | 5 | Pixel change threshold (0-255) |
 | `--full-frame` | off | Send every pixel every frame |
@@ -102,6 +122,7 @@ python3 transmitter.py --port COM13 --crop-x 100 --crop-y 50 --crop-width 800 --
 | `--crop-y` | 0 | Crop region Y offset (pixels from monitor top) |
 | `--crop-width` | *(full)* | Crop region width (required for cropping) |
 | `--crop-height` | *(full)* | Crop region height (required for cropping) |
+| `--stats` | off | Show periodic frame/packet statistics |
 
 ## Protocol
 
@@ -123,7 +144,7 @@ The receiver sends a single ACK byte (`0x06`) after processing each packet.
 type: 0 = press, 1 = move, 2 = release
 ```
 
-Touch coordinates are mapped from display space (800x480) to the captured monitor's pixel coordinates and translated into Windows mouse events.
+Touch coordinates are mapped from display space (800x480) to the captured monitor/window pixel coordinates (accounting for letterbox offset) and translated into Windows mouse events.
 
 ## Architecture
 

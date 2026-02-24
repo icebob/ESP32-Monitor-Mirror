@@ -8,6 +8,7 @@ to the ESP32 receiver over USB serial.
 import argparse
 import ctypes
 import struct
+import sys
 import threading
 import time
 from typing import Optional, Sequence
@@ -16,6 +17,9 @@ import cv2
 import mss
 import numpy as np
 import serial
+import win32con
+import win32gui
+import win32ui
 
 DISPLAY_WIDTH = 800
 DISPLAY_HEIGHT = 480
@@ -32,9 +36,11 @@ class ScreenshotSerialSender:
         target_fps: float,
         threshold: int,
         full_frame: bool,
+        show_stats: bool,
         max_updates_per_frame: int,
         rotate_deg: int,
         crop: Optional[tuple[int, int, int, int]] = None,
+        window_title: Optional[str] = None,
     ) -> None:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
@@ -43,9 +49,11 @@ class ScreenshotSerialSender:
         self.target_fps = target_fps
         self.threshold = threshold
         self.full_frame = full_frame
+        self.show_stats = show_stats
         self.max_updates_per_frame = max_updates_per_frame
         self.rotate_deg = rotate_deg
         self.crop = crop
+        self.window_title = window_title
 
         self.ser: Optional[serial.Serial] = None
         self.prev_rgb: Optional[np.ndarray] = None
@@ -53,6 +61,9 @@ class ScreenshotSerialSender:
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
         self.sct: Optional[mss.mss] = None
+        self.hwnd: Optional[int] = None
+        self._fit_offset: tuple[int, int] = (0, 0)  # letterbox offset (x, y)
+        self._fit_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT)  # scaled content size
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
         self._ack_event = threading.Event()
@@ -95,15 +106,32 @@ class ScreenshotSerialSender:
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
 
     def _map_touch_to_screen(self, tx: int, ty: int) -> tuple[int, int]:
-        """Map touch coords (800x480) to monitor pixel coords."""
+        """Map touch coords (800x480) to screen pixel coords, accounting for letterbox."""
+        # Reverse the letterbox: map display coords to content coords
+        x_off, y_off = self._fit_offset
+        fit_w, fit_h = self._fit_size
+        # Clamp to content area
+        cx = max(0, min(tx - x_off, fit_w - 1))
+        cy = max(0, min(ty - y_off, fit_h - 1))
+
+        if self.hwnd:
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+                w = right - left
+                h = bottom - top
+                sx = left + int(cx * w / fit_w)
+                sy = top + int(cy * h / fit_h)
+                return sx, sy
+            except Exception:
+                return tx, ty
         if not self.monitor:
             return tx, ty
         mon_left = self.monitor.get("left", 0)
         mon_top = self.monitor.get("top", 0)
         mon_w = self.monitor.get("width", DISPLAY_WIDTH)
         mon_h = self.monitor.get("height", DISPLAY_HEIGHT)
-        sx = mon_left + int(tx * mon_w / DISPLAY_WIDTH)
-        sy = mon_top + int(ty * mon_h / DISPLAY_HEIGHT)
+        sx = mon_left + int(cx * mon_w / fit_w)
+        sy = mon_top + int(cy * mon_h / fit_h)
         return sx, sy
 
     def wait_for_ack(self, timeout: float = 5.0) -> bool:
@@ -160,6 +188,86 @@ class ScreenshotSerialSender:
             self._reader_thread.join(timeout=2)
             self._reader_thread = None
 
+    # Window capture helpers ---------------------------------------------
+    @staticmethod
+    def list_windows() -> None:
+        """List all visible windows with titles."""
+        results = []
+
+        def _enum_cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                w, h = right - left, bottom - top
+                if w > 0 and h > 0:
+                    results.append((hwnd, title, w, h))
+
+        win32gui.EnumWindows(_enum_cb, None)
+        print(f"{'HWND':<12} {'Size':>10}  Title")
+        print("-" * 60)
+        for hwnd, title, w, h in sorted(results, key=lambda r: r[1].lower()):
+            print(f"0x{hwnd:08X}  {w:>4}x{h:<4}  {title}")
+
+    def find_window(self, title: str) -> bool:
+        """Find window by partial title match (case-insensitive)."""
+        title_lower = title.lower()
+        matches = []
+
+        def _enum_cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                wt = win32gui.GetWindowText(hwnd)
+                if wt and title_lower in wt.lower():
+                    matches.append((hwnd, wt))
+
+        win32gui.EnumWindows(_enum_cb, None)
+        if not matches:
+            print(f"[WIN] No window found matching '{title}'")
+            return False
+        self.hwnd = matches[0][0]
+        print(f"[WIN] Matched: '{matches[0][1]}' (HWND=0x{self.hwnd:08X})")
+        if len(matches) > 1:
+            print(f"[WIN] Note: {len(matches)} windows matched, using first")
+        return True
+
+    def grab_window(self) -> Optional[np.ndarray]:
+        """Capture window content using PrintWindow API."""
+        if not self.hwnd:
+            return None
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            w = right - left
+            h = bottom - top
+            if w <= 0 or h <= 0:
+                return None
+
+            hwnd_dc = win32gui.GetWindowDC(self.hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+
+            # PW_RENDERFULLCONTENT = 2 for better DirectX capture
+            ctypes.windll.user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 2)
+
+            bmp_info = bitmap.GetInfo()
+            bmp_bits = bitmap.GetBitmapBits(True)
+            frame = np.frombuffer(bmp_bits, dtype=np.uint8).reshape(
+                bmp_info["bmHeight"], bmp_info["bmWidth"], 4
+            )
+
+            # Cleanup GDI objects
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(self.hwnd, hwnd_dc)
+            win32gui.DeleteObject(bitmap.GetHandle())
+
+            # BGRA -> BGR
+            return frame[:, :, :3].copy()
+        except Exception as exc:
+            print(f"[WIN] Capture failed: {exc}")
+            return None
+
     # Monitor helpers ----------------------------------------------------
     @staticmethod
     def _select_monitor(
@@ -183,6 +291,15 @@ class ScreenshotSerialSender:
         return min(usable_monitors, key=lambda m: m.get("left", 0))
 
     def setup_capture(self) -> bool:
+        # Window capture mode
+        if self.window_title:
+            if not self.find_window(self.window_title):
+                return False
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            print(f"[WIN] Window size: {right - left}x{bottom - top}")
+            return True
+
+        # Monitor capture mode
         try:
             self.sct = mss.mss()
         except Exception as exc:
@@ -212,6 +329,8 @@ class ScreenshotSerialSender:
         return True
 
     def grab_frame(self) -> Optional[np.ndarray]:
+        if self.hwnd:
+            return self.grab_window()
         if not self.sct or not self.monitor:
             return None
         try:
@@ -240,7 +359,16 @@ class ScreenshotSerialSender:
         elif self.rotate_deg == 270:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        h, w = frame.shape[:2]
+        scale = min(DISPLAY_WIDTH / w, DISPLAY_HEIGHT / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        scaled = cv2.resize(frame, (new_w, new_h))
+        resized = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+        x_off = (DISPLAY_WIDTH - new_w) // 2
+        y_off = (DISPLAY_HEIGHT - new_h) // 2
+        resized[y_off:y_off + new_h, x_off:x_off + new_w] = scaled
+        self._fit_offset = (x_off, y_off)
+        self._fit_size = (new_w, new_h)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         rgb565 = self.rgb888_to_rgb565(rgb)
         return rgb, rgb565
@@ -357,7 +485,7 @@ class ScreenshotSerialSender:
                 if frame_delay > 0 and elapsed_frame < frame_delay:
                     time.sleep(frame_delay - elapsed_frame)
 
-                if now - start_t >= 2.0:
+                if self.show_stats and now - start_t >= 2.0:
                     elapsed = now - start_t
                     fps_est = frame_count / elapsed if elapsed > 0 else 0.0
                     print(
@@ -380,9 +508,9 @@ class ScreenshotSerialSender:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Capture a monitor and send pixel updates to ESP32 over serial"
+        description="Capture a monitor or window and send pixel updates to ESP32 over serial"
     )
-    parser.add_argument("--port", type=str, required=True, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
+    parser.add_argument("--port", type=str, default=None, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
     parser.add_argument("--baud", type=int, default=2000000, help="Baud rate (default 2000000)")
     parser.add_argument("--monitor-index", type=int, default=None, help="Monitor index (1-based)")
     parser.add_argument("--prefer-largest", action="store_true", help="Use largest monitor")
@@ -395,11 +523,23 @@ def parse_args(argv=None):
     parser.add_argument("--crop-y", type=int, default=None, help="Crop region Y offset (pixels from monitor top)")
     parser.add_argument("--crop-width", type=int, default=None, help="Crop region width")
     parser.add_argument("--crop-height", type=int, default=None, help="Crop region height")
+    parser.add_argument("--stats", action="store_true", help="Show periodic frame/packet statistics")
+    parser.add_argument("--window", type=str, default=None, help="Capture window by title (partial match, e.g. 'AS1000_PFD')")
+    parser.add_argument("--list-windows", action="store_true", help="List all visible windows and exit")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.list_windows:
+        ScreenshotSerialSender.list_windows()
+        sys.exit(0)
+
+    if not args.port:
+        print("Error: --port is required (unless using --list-windows)")
+        sys.exit(1)
+
     crop = None
     if args.crop_width and args.crop_height:
         crop = (args.crop_x or 0, args.crop_y or 0, args.crop_width, args.crop_height)
@@ -412,9 +552,11 @@ def main(argv=None):
         target_fps=args.target_fps,
         threshold=args.threshold,
         full_frame=args.full_frame,
+        show_stats=args.stats,
         max_updates_per_frame=args.max_updates_per_frame,
         rotate_deg=args.rotate,
         crop=crop,
+        window_title=args.window,
     )
     sender.run()
 
