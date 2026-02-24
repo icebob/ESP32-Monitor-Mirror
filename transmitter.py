@@ -21,6 +21,9 @@ import win32con
 import win32gui
 import win32ui
 
+# Enable Per-Monitor DPI awareness so GetWindowRect returns physical pixels
+ctypes.windll.shcore.SetProcessDpiAwareness(2)
+
 DISPLAY_WIDTH = 800
 DISPLAY_HEIGHT = 480
 RUN_HEADER_VERSION = 0x02
