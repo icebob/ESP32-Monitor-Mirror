@@ -12,7 +12,7 @@
  *   Flash Size: 4MB
  *   Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)
  *   PSRAM: OPI PSRAM
- *   USB CDC On Boot: Enabled
+ *   USB CDC On Boot: Disabled  (use UART0 via CH340)
  */
 
 #include <LovyanGFX.hpp>
@@ -106,7 +106,9 @@ bool wasTouched = false;
 
 // Protocol constants
 const uint8_t MAGIC_RUN[4] = {'P', 'X', 'U', 'R'};
+const uint8_t MAGIC_LZ4[4] = {'P', 'X', 'L', 'Z'};
 const uint8_t RUN_VERSION   = 0x02;
+const uint8_t LZ4_VERSION   = 0x01;
 
 // Stats
 unsigned long frameCount = 0;
@@ -115,6 +117,79 @@ unsigned long updatesApplied = 0;
 // Raw byte buffer for bulk reads
 uint8_t* rawBuffer = nullptr;
 uint32_t rawBufferSize = 0;
+
+// LZ4 frame buffer in PSRAM (800*480*2 = 768000 bytes)
+#define FRAME_BUFFER_SIZE (DISPLAY_WIDTH * DISPLAY_HEIGHT * 2)
+uint16_t* lz4FrameBuffer = nullptr;
+
+// --- Inline LZ4 block decompressor ---
+// Returns decompressed size, or -1 on error
+int lz4_decompress(const uint8_t* src, int srcLen, uint8_t* dst, int maxDstLen) {
+  const uint8_t* srcEnd = src + srcLen;
+  uint8_t* dstStart = dst;
+  uint8_t* dstEnd = dst + maxDstLen;
+
+  while (src < srcEnd) {
+    // Read token
+    uint8_t token = *src++;
+    int literalLen = token >> 4;
+    int matchLen = token & 0x0F;
+
+    // Decode literal length
+    if (literalLen == 15) {
+      uint8_t s;
+      do {
+        if (src >= srcEnd) return -1;
+        s = *src++;
+        literalLen += s;
+      } while (s == 255);
+    }
+
+    // Copy literals
+    if (src + literalLen > srcEnd || dst + literalLen > dstEnd) return -1;
+    memcpy(dst, src, literalLen);
+    src += literalLen;
+    dst += literalLen;
+
+    // Check if this was the last sequence (no match after last literals)
+    if (src >= srcEnd) break;
+
+    // Read match offset (2 bytes, little-endian)
+    if (src + 2 > srcEnd) return -1;
+    int offset = src[0] | (src[1] << 8);
+    src += 2;
+    if (offset == 0 || dst - offset < dstStart) return -1;
+
+    // Decode match length (minmatch = 4)
+    matchLen += 4;
+    if (matchLen == 19) { // 15 + 4
+      uint8_t s;
+      do {
+        if (src >= srcEnd) return -1;
+        s = *src++;
+        matchLen += s;
+      } while (s == 255);
+    }
+
+    // Copy match (may overlap, so byte-by-byte for small offsets)
+    if (dst + matchLen > dstEnd) return -1;
+    uint8_t* matchSrc = dst - offset;
+    if (offset >= 8) {
+      // Fast path: non-overlapping or large offset
+      while (matchLen >= 8) {
+        memcpy(dst, matchSrc, 8);
+        dst += 8;
+        matchSrc += 8;
+        matchLen -= 8;
+      }
+    }
+    while (matchLen-- > 0) {
+      *dst++ = *matchSrc++;
+    }
+  }
+
+  return (int)(dst - dstStart);
+}
 
 bool ensureRawBuffer(uint32_t needed) {
   if (needed <= rawBufferSize && rawBuffer != nullptr) {
@@ -175,6 +250,12 @@ void setup() {
 
   tft.init();
 
+  // Allocate LZ4 frame buffer in PSRAM
+  lz4FrameBuffer = (uint16_t*)ps_malloc(FRAME_BUFFER_SIZE);
+  if (lz4FrameBuffer) {
+    memset(lz4FrameBuffer, 0, FRAME_BUFFER_SIZE);
+  }
+
   // Init touch
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
   ts.begin();
@@ -184,6 +265,10 @@ void setup() {
 }
 
 void handleTouch();  // forward declaration
+
+// Packet type detected by syncToMagic
+enum PacketType { PKT_NONE, PKT_RUN, PKT_LZ4 };
+PacketType lastPacketType = PKT_NONE;
 
 // Scan for magic bytes in the serial stream, check touch while waiting
 bool syncToMagic() {
@@ -203,10 +288,20 @@ bool syncToMagic() {
       pos++;
       if (pos >= 4) {
         int s = pos % 4;
+        // Check for PXUR
         if (buf[s] == MAGIC_RUN[0] &&
             buf[(s+1)%4] == MAGIC_RUN[1] &&
             buf[(s+2)%4] == MAGIC_RUN[2] &&
             buf[(s+3)%4] == MAGIC_RUN[3]) {
+          lastPacketType = PKT_RUN;
+          return true;
+        }
+        // Check for PXLZ
+        if (buf[s] == MAGIC_LZ4[0] &&
+            buf[(s+1)%4] == MAGIC_LZ4[1] &&
+            buf[(s+2)%4] == MAGIC_LZ4[2] &&
+            buf[(s+3)%4] == MAGIC_LZ4[3]) {
+          lastPacketType = PKT_LZ4;
           return true;
         }
       }
@@ -271,6 +366,46 @@ void sendTouchEvent(uint16_t x, uint16_t y, uint8_t type) {
   Serial.write(pkt, 8);
 }
 
+void handleLZ4Packet() {
+  // Header after magic: version(1) + frame_id(4) + compressed_size(4) + original_size(4) = 13 bytes
+  uint8_t hdr[13];
+  if (!readExactly(hdr, 13)) return;
+
+  if (hdr[0] != LZ4_VERSION) return;
+
+  uint32_t frameId = ((uint32_t)hdr[1]) | ((uint32_t)hdr[2] << 8) |
+                     ((uint32_t)hdr[3] << 16) | ((uint32_t)hdr[4] << 24);
+  uint32_t compressedSize = ((uint32_t)hdr[5]) | ((uint32_t)hdr[6] << 8) |
+                            ((uint32_t)hdr[7] << 16) | ((uint32_t)hdr[8] << 24);
+  uint32_t originalSize = ((uint32_t)hdr[9]) | ((uint32_t)hdr[10] << 8) |
+                          ((uint32_t)hdr[11] << 16) | ((uint32_t)hdr[12] << 24);
+
+  // Sanity checks
+  if (compressedSize > 1000000 || originalSize != FRAME_BUFFER_SIZE) return;
+  if (!lz4FrameBuffer) return;
+
+  // Read compressed data
+  if (!ensureRawBuffer(compressedSize)) return;
+  if (!readExactly(rawBuffer, compressedSize)) return;
+
+  // Decompress
+  int decompLen = lz4_decompress(rawBuffer, compressedSize,
+                                  (uint8_t*)lz4FrameBuffer, FRAME_BUFFER_SIZE);
+  if (decompLen != FRAME_BUFFER_SIZE) {
+    Serial.write(0x06);  // ACK anyway to avoid lockup
+    return;
+  }
+
+  // Push entire frame to display
+  tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, lz4FrameBuffer);
+
+  // Send ACK
+  Serial.write(0x06);
+
+  frameCount++;
+  updatesApplied += DISPLAY_WIDTH * DISPLAY_HEIGHT;
+}
+
 void handleTouch() {
   ts.read();
   if (ts.isTouched) {
@@ -290,7 +425,11 @@ void handleTouch() {
 
 void loop() {
   if (syncToMagic()) {
-    handlePacket();
+    if (lastPacketType == PKT_LZ4) {
+      handleLZ4Packet();
+    } else {
+      handlePacket();
+    }
   }
   handleTouch();
 }

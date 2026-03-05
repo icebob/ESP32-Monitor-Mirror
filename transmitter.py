@@ -14,6 +14,7 @@ import time
 from typing import Optional, Sequence
 
 import cv2
+import lz4.block
 import mss
 import numpy as np
 import serial
@@ -160,7 +161,16 @@ class ScreenshotSerialSender:
                         continue
                     idx = buf.find(b'TCH')
                     if idx < 0:
-                        buf = buf[-2:] if len(buf) > 2 else buf
+                        # Print debug text from ESP32
+                        try:
+                            txt = bytes(buf).decode('ascii', errors='ignore')
+                            if txt.strip():
+                                for line in txt.strip().splitlines():
+                                    if line.strip():
+                                        print(f"[ESP32] {line.strip()}")
+                        except Exception:
+                            pass
+                        buf.clear()
                         break
                     if idx > 0:
                         buf = buf[idx:]
@@ -380,6 +390,20 @@ class ScreenshotSerialSender:
         return rgb, rgb565
 
     # Packet creation ----------------------------------------------------
+    def build_lz4_packet(self, rgb565: np.ndarray) -> bytes:
+        """Build an LZ4-compressed full-frame packet."""
+        raw = rgb565.byteswap().tobytes()
+        compressed = lz4.block.compress(raw, store_size=False)
+        header = (
+            b"PXLZ"
+            + bytes([0x01])  # version
+            + struct.pack("<I", self.frame_id)
+            + struct.pack("<I", len(compressed))
+            + struct.pack("<I", len(raw))
+        )
+        self.frame_id += 1
+        return header + compressed
+
     def build_run_packets(self, rgb: np.ndarray, rgb565: np.ndarray) -> list[bytes]:
         if self.full_frame or not self.sent_initial_full or self.prev_rgb is None:
             mask = np.ones((DISPLAY_HEIGHT, DISPLAY_WIDTH), dtype=bool)
@@ -464,26 +488,37 @@ class ScreenshotSerialSender:
                     break
 
                 rgb, rgb565 = self.resize_and_convert(frame)
-                packets = self.build_run_packets(rgb, rgb565)
-                self.prev_rgb = rgb
 
-                if not packets and not self.sent_initial_full:
-                    continue
-
-                for pkt in packets:
-                    runs_in_pkt = struct.unpack_from("<H", pkt, 9)[0]
+                # Use LZ4 for first frame (full), RLE for incremental
+                if not self.sent_initial_full or self.prev_rgb is None:
+                    lz4_pkt = self.build_lz4_packet(rgb565)
                     try:
-                        self.ser.write(pkt)
+                        self.ser.write(lz4_pkt)
                         sent_packets += 1
-                        sent_runs += runs_in_pkt
-                        if runs_in_pkt > 0 and not self.wait_for_ack(10.0):
-                            print("[ACK] Timeout - no ACK received")
+                        compressed_size = len(lz4_pkt) - 17  # minus header
+                        original_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * 2
+                        ratio = original_size / compressed_size if compressed_size > 0 else 0
+                        print(f"[LZ4] Full frame: {original_size}B -> {compressed_size}B ({ratio:.1f}x)")
+                        if not self.wait_for_ack(10.0):
+                            print("[ACK] Timeout - no ACK for LZ4 frame")
                     except Exception as exc:
                         print(f"[SEND] Error: {type(exc).__name__}: {exc}")
-                        break
-
-                if not self.sent_initial_full:
                     self.sent_initial_full = True
+                else:
+                    packets = self.build_run_packets(rgb, rgb565)
+                    for pkt in packets:
+                        runs_in_pkt = struct.unpack_from("<H", pkt, 9)[0]
+                        try:
+                            self.ser.write(pkt)
+                            sent_packets += 1
+                            sent_runs += runs_in_pkt
+                            if runs_in_pkt > 0 and not self.wait_for_ack(10.0):
+                                print("[ACK] Timeout - no ACK received")
+                        except Exception as exc:
+                            print(f"[SEND] Error: {type(exc).__name__}: {exc}")
+                            break
+
+                self.prev_rgb = rgb
 
                 frame_count += 1
                 now = time.time()
@@ -523,7 +558,7 @@ def parse_args(argv=None):
     parser.add_argument("--target-fps", type=float, default=10.0, help="Target FPS (default 10)")
     parser.add_argument("--threshold", type=int, default=5, help="Pixel change threshold (default 5)")
     parser.add_argument("--full-frame", action="store_true", help="Send every pixel every frame")
-    parser.add_argument("--max-updates-per-frame", type=int, default=8000, help="Max runs per packet (default 8000)")
+    parser.add_argument("--max-updates-per-frame", type=int, default=30000, help="Max runs per packet (default 30000)")
     parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="Rotation degrees")
     parser.add_argument("--crop-x", type=int, default=None, help="Crop region X offset (pixels from monitor left)")
     parser.add_argument("--crop-y", type=int, default=None, help="Crop region Y offset (pixels from monitor top)")
