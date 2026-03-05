@@ -44,7 +44,7 @@ class ScreenshotSerialSender:
         max_updates_per_frame: int,
         rotate_deg: int,
         crop: Optional[tuple[int, int, int, int]] = None,
-        window_title: Optional[str] = None,
+        window_titles: Optional[list[str]] = None,
         window_crop_top: int = 0,
     ) -> None:
         self.serial_port = serial_port
@@ -58,7 +58,7 @@ class ScreenshotSerialSender:
         self.max_updates_per_frame = max_updates_per_frame
         self.rotate_deg = rotate_deg
         self.crop = crop
-        self.window_title = window_title
+        self.window_titles = window_titles or []
         self.window_crop_top = window_crop_top
 
         self.ser: Optional[serial.Serial] = None
@@ -67,7 +67,7 @@ class ScreenshotSerialSender:
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
         self.sct: Optional[mss.mss] = None
-        self.hwnd: Optional[int] = None
+        self.hwnds: list[int] = []
         self._fit_offset: tuple[int, int] = (0, 0)  # letterbox offset (x, y)
         self._fit_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT)  # scaled content size
         self._reader_thread: Optional[threading.Thread] = None
@@ -113,16 +113,44 @@ class ScreenshotSerialSender:
 
     def _map_touch_to_screen(self, tx: int, ty: int) -> tuple[int, int]:
         """Map touch coords (800x480) to screen pixel coords, accounting for letterbox."""
-        # Reverse the letterbox: map display coords to content coords
+        # Dual window mode: contain-fit mapping per half
+        if len(self.hwnds) == 2:
+            half_w = DISPLAY_WIDTH // 2  # 400
+            if tx < half_w:
+                hwnd = self.hwnds[0]
+                local_x = tx
+            else:
+                hwnd = self.hwnds[1]
+                local_x = tx - half_w
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                win_w = right - left
+                win_h = bottom - top - self.window_crop_top
+                # Compute contain-fit offsets within the half
+                scale = min(half_w / win_w, DISPLAY_HEIGHT / win_h)
+                fit_w = int(win_w * scale)
+                fit_h = int(win_h * scale)
+                x_off = (half_w - fit_w) // 2
+                y_off = (DISPLAY_HEIGHT - fit_h) // 2
+                # Clamp to content area
+                cx = max(0, min(local_x - x_off, fit_w - 1))
+                cy = max(0, min(ty - y_off, fit_h - 1))
+                sx = left + int(cx * win_w / fit_w)
+                sy = top + self.window_crop_top + int(cy * win_h / fit_h)
+                return sx, sy
+            except Exception:
+                return tx, ty
+
+        # Single window / letterbox mapping
         x_off, y_off = self._fit_offset
         fit_w, fit_h = self._fit_size
         # Clamp to content area
         cx = max(0, min(tx - x_off, fit_w - 1))
         cy = max(0, min(ty - y_off, fit_h - 1))
 
-        if self.hwnd:
+        if self.hwnds:
             try:
-                left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+                left, top, right, bottom = win32gui.GetWindowRect(self.hwnds[0])
                 w = right - left
                 h = bottom - top - self.window_crop_top
                 sx = left + int(cx * w / fit_w)
@@ -223,8 +251,8 @@ class ScreenshotSerialSender:
         for hwnd, title, w, h in sorted(results, key=lambda r: r[1].lower()):
             print(f"0x{hwnd:08X}  {w:>4}x{h:<4}  {title}")
 
-    def find_window(self, title: str) -> bool:
-        """Find window by partial title match (case-insensitive)."""
+    def find_window(self, title: str) -> Optional[int]:
+        """Find window by partial title match (case-insensitive). Returns HWND or None."""
         title_lower = title.lower()
         matches = []
 
@@ -237,25 +265,23 @@ class ScreenshotSerialSender:
         win32gui.EnumWindows(_enum_cb, None)
         if not matches:
             print(f"[WIN] No window found matching '{title}'")
-            return False
-        self.hwnd = matches[0][0]
-        print(f"[WIN] Matched: '{matches[0][1]}' (HWND=0x{self.hwnd:08X})")
+            return None
+        hwnd = matches[0][0]
+        print(f"[WIN] Matched: '{matches[0][1]}' (HWND=0x{hwnd:08X})")
         if len(matches) > 1:
             print(f"[WIN] Note: {len(matches)} windows matched, using first")
-        return True
+        return hwnd
 
-    def grab_window(self) -> Optional[np.ndarray]:
+    def grab_window(self, hwnd: int) -> Optional[np.ndarray]:
         """Capture window content using PrintWindow API."""
-        if not self.hwnd:
-            return None
         try:
-            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             w = right - left
             h = bottom - top
             if w <= 0 or h <= 0:
                 return None
 
-            hwnd_dc = win32gui.GetWindowDC(self.hwnd)
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
             mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
             save_dc = mfc_dc.CreateCompatibleDC()
             bitmap = win32ui.CreateBitmap()
@@ -263,7 +289,7 @@ class ScreenshotSerialSender:
             save_dc.SelectObject(bitmap)
 
             # PW_RENDERFULLCONTENT = 2 for better DirectX capture
-            ctypes.windll.user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 2)
+            ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
 
             bmp_info = bitmap.GetInfo()
             bmp_bits = bitmap.GetBitmapBits(True)
@@ -274,7 +300,7 @@ class ScreenshotSerialSender:
             # Cleanup GDI objects
             save_dc.DeleteDC()
             mfc_dc.DeleteDC()
-            win32gui.ReleaseDC(self.hwnd, hwnd_dc)
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
             win32gui.DeleteObject(bitmap.GetHandle())
 
             # BGRA -> BGR, apply top crop
@@ -308,11 +334,16 @@ class ScreenshotSerialSender:
 
     def setup_capture(self) -> bool:
         # Window capture mode
-        if self.window_title:
-            if not self.find_window(self.window_title):
-                return False
-            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
-            print(f"[WIN] Window size: {right - left}x{bottom - top}")
+        if self.window_titles:
+            for title in self.window_titles:
+                hwnd = self.find_window(title)
+                if hwnd is None:
+                    return False
+                self.hwnds.append(hwnd)
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                print(f"[WIN] Window size: {right - left}x{bottom - top}")
+            if len(self.hwnds) == 2:
+                print(f"[WIN] Dual window mode: side-by-side {DISPLAY_WIDTH // 2}x{DISPLAY_HEIGHT} each")
             return True
 
         # Monitor capture mode
@@ -344,9 +375,33 @@ class ScreenshotSerialSender:
         )
         return True
 
+    @staticmethod
+    def _contain_fit(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+        """Resize frame to fit target_w x target_h with aspect ratio preserved, black bars."""
+        h, w = frame.shape[:2]
+        scale = min(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        scaled = cv2.resize(frame, (new_w, new_h))
+        result = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        x_off = (target_w - new_w) // 2
+        y_off = (target_h - new_h) // 2
+        result[y_off:y_off + new_h, x_off:x_off + new_w] = scaled
+        return result
+
     def grab_frame(self) -> Optional[np.ndarray]:
-        if self.hwnd:
-            return self.grab_window()
+        if self.hwnds:
+            if len(self.hwnds) == 2:
+                # Dual window: contain-fit each to half width, hstack
+                half_w = DISPLAY_WIDTH // 2
+                frames = []
+                for hwnd in self.hwnds:
+                    f = self.grab_window(hwnd)
+                    if f is None:
+                        return None
+                    frames.append(self._contain_fit(f, half_w, DISPLAY_HEIGHT))
+                return np.hstack(frames)
+            else:
+                return self.grab_window(self.hwnds[0])
         if not self.sct or not self.monitor:
             return None
         try:
@@ -565,7 +620,7 @@ def parse_args(argv=None):
     parser.add_argument("--crop-width", type=int, default=None, help="Crop region width")
     parser.add_argument("--crop-height", type=int, default=None, help="Crop region height")
     parser.add_argument("--stats", action="store_true", help="Show periodic frame/packet statistics")
-    parser.add_argument("--window", type=str, default=None, help="Capture window by title (partial match, e.g. 'AS1000_PFD')")
+    parser.add_argument("--window", type=str, nargs='+', default=None, help="Capture 1 or 2 windows by title (e.g. --window 'PFD' 'MFD' for side-by-side)")
     parser.add_argument("--window-crop-top", type=int, default=0, help="Pixels to crop from top of window (e.g. 32 to hide title bar)")
     parser.add_argument("--list-windows", action="store_true", help="List all visible windows and exit")
     return parser.parse_args(argv)
@@ -598,7 +653,7 @@ def main(argv=None):
         max_updates_per_frame=args.max_updates_per_frame,
         rotate_deg=args.rotate,
         crop=crop,
-        window_title=args.window,
+        window_titles=args.window,
         window_crop_top=args.window_crop_top,
     )
     sender.run()
