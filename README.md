@@ -86,7 +86,7 @@ python3 transmitter.py --port COM13 --window "Notepad"
 python3 transmitter.py --port COM13 --window "AS1000_PFD"
 
 # Hide the window title bar (crop top 32 pixels)
-python3 transmitter.py --port COM13 --window "WASMINSTRUMENT" --window-crop-top 32
+python3 transmitter.py --port COM13 --window-crop-top 32 --window "A32NX_PFD_1" "WASMINSTRUMENT" 
 
 # --- Other options ---
 
