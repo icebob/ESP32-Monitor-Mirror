@@ -46,6 +46,7 @@ class ScreenshotSerialSender:
         crop: Optional[tuple[int, int, int, int]] = None,
         window_titles: Optional[list[str]] = None,
         window_crop_top: int = 0,
+        full_refresh_interval: int = 0,
     ) -> None:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
@@ -60,10 +61,12 @@ class ScreenshotSerialSender:
         self.crop = crop
         self.window_titles = window_titles or []
         self.window_crop_top = window_crop_top
+        self.full_refresh_interval = full_refresh_interval
 
         self.ser: Optional[serial.Serial] = None
         self.prev_rgb: Optional[np.ndarray] = None
         self.sent_initial_full: bool = False
+        self._frames_since_full: int = 0
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
         self.sct: Optional[mss.mss] = None
@@ -544,8 +547,15 @@ class ScreenshotSerialSender:
 
                 rgb, rgb565 = self.resize_and_convert(frame)
 
-                # Use LZ4 for first frame (full), RLE for incremental
-                if not self.sent_initial_full or self.prev_rgb is None:
+                # Periodic full refresh to clear ghost pixels from threshold-based delta
+                need_full = (
+                    not self.sent_initial_full
+                    or self.prev_rgb is None
+                    or (self.full_refresh_interval > 0
+                        and self._frames_since_full >= self.full_refresh_interval)
+                )
+
+                if need_full:
                     lz4_pkt = self.build_lz4_packet(rgb565)
                     try:
                         self.ser.write(lz4_pkt)
@@ -553,12 +563,14 @@ class ScreenshotSerialSender:
                         compressed_size = len(lz4_pkt) - 17  # minus header
                         original_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * 2
                         ratio = original_size / compressed_size if compressed_size > 0 else 0
-                        print(f"[LZ4] Full frame: {original_size}B -> {compressed_size}B ({ratio:.1f}x)")
+                        if not self.sent_initial_full:
+                            print(f"[LZ4] Full frame: {original_size}B -> {compressed_size}B ({ratio:.1f}x)")
                         if not self.wait_for_ack(10.0):
                             print("[ACK] Timeout - no ACK for LZ4 frame")
                     except Exception as exc:
                         print(f"[SEND] Error: {type(exc).__name__}: {exc}")
                     self.sent_initial_full = True
+                    self._frames_since_full = 0
                 else:
                     packets = self.build_run_packets(rgb, rgb565)
                     for pkt in packets:
@@ -574,6 +586,7 @@ class ScreenshotSerialSender:
                             break
 
                 self.prev_rgb = rgb
+                self._frames_since_full += 1
 
                 frame_count += 1
                 now = time.time()
@@ -620,6 +633,7 @@ def parse_args(argv=None):
     parser.add_argument("--crop-width", type=int, default=None, help="Crop region width")
     parser.add_argument("--crop-height", type=int, default=None, help="Crop region height")
     parser.add_argument("--stats", action="store_true", help="Show periodic frame/packet statistics")
+    parser.add_argument("--full-refresh-interval", type=int, default=50, help="Send LZ4 full frame every N frames to clear ghost pixels (0=disabled, default 50)")
     parser.add_argument("--window", type=str, nargs='+', default=None, help="Capture 1 or 2 windows by title (e.g. --window 'PFD' 'MFD' for side-by-side)")
     parser.add_argument("--window-crop-top", type=int, default=0, help="Pixels to crop from top of window (e.g. 32 to hide title bar)")
     parser.add_argument("--list-windows", action="store_true", help="List all visible windows and exit")
@@ -655,6 +669,7 @@ def main(argv=None):
         crop=crop,
         window_titles=args.window,
         window_crop_top=args.window_crop_top,
+        full_refresh_interval=args.full_refresh_interval,
     )
     sender.run()
 
